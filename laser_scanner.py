@@ -68,19 +68,38 @@ class ModelModifier:
 
     def save_snr_to_json(self):
         filename = f"snr_results_{self.model_name.split('/')[-1]}.json"
-        sorted_layer_snr = dict(sorted(self.layer_snr.items(), key=lambda x: x[1], reverse=True))
+        
+        # Group layers by their names
+        layer_groups = {}
+        for layer_name, snr_value in self.layer_snr.items():
+            group_name = '_'.join(layer_name.split('_')[:-1])
+            if group_name not in layer_groups:
+                layer_groups[group_name] = {}
+            layer_groups[group_name][layer_name] = snr_value
+        
+        # Sort layers within each group by SNR value in descending order
+        sorted_layer_groups = {}
+        for group_name, group_layers in layer_groups.items():
+            sorted_layer_groups[group_name] = dict(sorted(group_layers.items(), key=lambda x: x[1], reverse=True))
+        
         with open(filename, 'w') as file:
-            json.dump({k: float(v) for k, v in sorted_layer_snr.items()}, file, indent=4)
+            json.dump({group_name: {k: float(v) for k, v in group_layers.items()}
+                       for group_name, group_layers in sorted_layer_groups.items()}, file, indent=4)
+        
         print(f"Results saved to {filename}")
-        # Generate YAML file for the top 50% SNR
-        self.generate_unfrozen_params_yaml(sorted_layer_snr)
-
-    def generate_unfrozen_params_yaml(self, sorted_snr):
-        top_layers = list(sorted_snr.keys())[:len(sorted_snr) // 2]  # Top 50% layers
+        
+        # Generate YAML file for the top n% SNR within each group
+        self.generate_unfrozen_params_yaml(sorted_layer_groups)
+    
+    def generate_unfrozen_params_yaml(self, sorted_layer_groups, top_percent=50):
         with open(f"unfrozen_parameters_{self.model_name.split('/')[-1]}.yaml", 'w') as file:
             file.write("unfrozen_parameters:\n")
-            for layer in top_layers:
-                file.write(f"- {layer}\n")
+            for group_name, group_layers in sorted_layer_groups.items():
+                num_layers = len(group_layers)
+                num_top_layers = int(num_layers * top_percent / 100)
+                top_layers = list(group_layers.keys())[:num_top_layers]
+                for layer in top_layers:
+                    file.write(f"- {layer}\n")
 
 # Usage
 model_name = "stabilityai/stablelm-2-1_6b"

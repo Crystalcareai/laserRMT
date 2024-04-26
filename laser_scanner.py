@@ -1,64 +1,85 @@
-from accelerate import Accelerator
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import numpy as np
 import json
-import gc
 from prompt_toolkit.shortcuts import checkboxlist_dialog
+import argparse
+from tqdm import tqdm
 
 class ModelModifier:
-    def __init__(self, model_name):
-        self.accelerator = Accelerator()  # Initialize Accelerator
+    def __init__(self, model_name=None, top_percent=50):
         self.model_name = model_name
-        # Use float32 for higher precision computations as default and enable automatic device mapping
-        self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, device_map="auto")
-        self.model, self.optimizer = self.accelerator.prepare(self.model, torch.optim.Adam(self.model.parameters()))
-        self.tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True, add_prefix_space=True)
+        self.top_percent = top_percent
+
+        if model_name:
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True, device_map="auto")
+            self.optimizer = torch.optim.Adam(self.model.parameters())
+            self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=True, add_prefix_space=True)
+        else:
+            self.model = None
+            self.optimizer = None
+            self.tokenizer = None
+
         self.layer_snr = {}
+        self.layer_types = []
 
     def get_weight_types(self):
         weight_types = set()
         for name, module in self.model.named_modules():
             parts = name.split('.')
-            if hasattr(module, 'weight') and len(parts) > 2:
-                weight_types.add(parts[-1])
+            if any(hasattr(module, attr) for attr in ['weight', 'bias','inv_freq']):
+                layer_index = next((i for i, part in enumerate(parts) if part.isdigit()), -1)
+                weight_type = '.'.join(parts[layer_index + 1:]) if layer_index != -1 else name
+                weight_types.add(weight_type)
         return list(weight_types)
 
     def interactive_select_weights(self):
         weight_types = self.get_weight_types()
+        sorted_weight_types = self.sort_weight_types(weight_types)
         selected_types = checkboxlist_dialog(
-            title="Select Weight Types",
-            text="Select weight types to scan for SNR:",
-            values=[(wt, wt) for wt in weight_types]
+            title="Select Weight Types", 
+            text="Deselect the weight types you do not want to scan for SNR:",
+            values=[(wt, wt) for wt in sorted_weight_types],
+            default_values=sorted_weight_types
         ).run()
+        self.layer_types = selected_types
         return selected_types
 
-    def calculate_snr_for_layer(self, layer_type):
-        batch_size = self.determine_batch_size()
-        layers = [(name, module) for name, module in self.model.named_modules() if layer_type in name and hasattr(module, 'weight')]
-        for i in range(0, len(layers), batch_size):
-            batch_layers = layers[i:i + batch_size]
-            for name, module in batch_layers:
-                weights = module.weight.detach().double()  # Convert to double for precision in calculations
-                S = torch.linalg.svdvals(weights)
-                max_singular_value = S[0].item()
-                sigma_estimated = self.estimate_sigma_with_full_iqr(S)
-                n, m = weights.shape
-                mp_threshold = self.marchenko_pastur_threshold(sigma_estimated, n, m)
-                signal = S[S > mp_threshold].sum().item()
-                noise = S[S <= mp_threshold].sum().item()
-                snr = signal / noise if noise != 0 else float('inf')
-                snr_ratio = snr / max_singular_value
-                self.layer_snr[name] = snr_ratio
-                print(f"Calculated SNR for {name}: {snr_ratio}")
-                del S, weights
-                gc.collect()
+    def sort_weight_types(self, weight_types):
+        categories = {}
+        for wt in weight_types:
+            category = wt.split('.')[0]
+            categories.setdefault(category, []).append(wt)
+        sorted_categories = {k: sorted(v) for k, v in sorted(categories.items(), key=lambda item: item[0])}
+        sorted_weight_types = [wt for sublist in sorted_categories.values() for wt in sublist]
+        return sorted_weight_types
 
-    def determine_batch_size(self):
-        total_memory = torch.cuda.get_device_properties(0).total_memory
-        free_memory = total_memory - torch.cuda.memory_reserved(0)
-        estimated_memory_per_layer = 512 * 1024 * 1024  # Estimate 512 MB per layer
-        return max(1, int(free_memory / estimated_memory_per_layer))
+    def calculate_snr_for_layer(self, layer_type):
+        layers = [(name, module) for name, module in self.model.named_modules() if layer_type in name and hasattr(module, 'weight')]
+        num_batches = (len(layers) + 2) // 3
+
+        with tqdm(total=num_batches, unit='batch', desc=f'Calculating SNR for {layer_type}') as progress_bar:
+            for i in range(0, len(layers), 3):
+                batch_layers = layers[i:i + 3]
+                for name, module in batch_layers:
+                    weights = module.weight.detach() 
+                    if weights.ndim < 2:
+                        weights = weights.unsqueeze(0)
+                    if weights.is_meta:
+                        weights = weights.to(torch.float32) 
+                    S = torch.linalg.svdvals(weights)
+                    if S.is_meta:
+                        S = S.to(torch.float32)
+                    max_singular_value = S[0].item()
+                    sigma_estimated = self.estimate_sigma_with_full_iqr(S)
+                    n, m = weights.shape[-2:]
+                    mp_threshold = self.marchenko_pastur_threshold(sigma_estimated, n, m)
+                    signal = S[S > mp_threshold].sum().item()
+                    noise = S[S <= mp_threshold].sum().item()
+                    snr = signal / noise if noise != 0 else float('inf')
+                    snr_ratio = snr / max_singular_value
+                    self.layer_snr[name] = {'type': layer_type, 'snr': snr_ratio}
+                progress_bar.update(1)
 
     @staticmethod
     def marchenko_pastur_threshold(sigma, n, m):
@@ -75,23 +96,83 @@ class ModelModifier:
         return sigma_estimated
 
     def assess_layers_snr(self, selected_weight_types):
-        for layer_type in selected_weight_types:
-            self.calculate_snr_for_layer(layer_type)
+        # Assess SNR for all selected layer types
+        with tqdm(total=len(selected_weight_types), unit='type', desc='Calculating SNR for types') as progress_bar:
+            for layer_type in selected_weight_types:
+                self.calculate_snr_for_layer(layer_type)
+                progress_bar.update(1)
 
     def save_snr_to_json(self):
-        filename = f"snr_results_{self.model_name.split('/')[-1]}.json"
+        filename = f"snr_results_{self.model_name.split('/')[-1]}.json" if self.model_name else "snr_results.json"
+        serializable_data = {}
+        for layer_name, info in self.layer_snr.items():
+            snr_value = info['snr'].item() if isinstance(info['snr'], torch.Tensor) else info['snr']
+            layer_type = str(info['type'])
+            serializable_data[layer_name] = {'snr': snr_value, 'type': layer_type}
         with open(filename, 'w') as file:
-            json.dump({k: float(v) for k, v in self.layer_snr.items()}, file, indent=4)
+            json.dump(serializable_data, file, indent=4)
         print(f"Results saved to {filename}")
+        self.save_top_snr_ratios_to_json(filename)
+        self.generate_unfrozen_params_yaml(filename)
 
-# Usage
-model_name = "meta-llama/Meta-Llama-3-8B"  # Update with the appropriate model path
-modifier = ModelModifier(model_name)
-selected_weight_types = modifier.interactive_select_weights()
+    def generate_unfrozen_params_yaml(self, json_filename, top_percent=None):
+        top_percent = top_percent if top_percent is not None else self.top_percent
+        with open(json_filename, 'r') as file:
+            snr_data = json.load(file)
+        unfrozen_parameters = {}
+        for layer_name, info in snr_data.items():
+            layer_type = info['type']
+            if layer_type not in unfrozen_parameters:
+                unfrozen_parameters[layer_type] = []
+            unfrozen_parameters[layer_type].append((layer_name, info['snr']))
+        top_layers_by_type = {}
+        for layer_type, layers in unfrozen_parameters.items():
+            layers_sorted = sorted(layers, key=lambda x: x[1], reverse=True)
+            num_top_layers = int(len(layers) * top_percent / 100)
+            top_layers_by_type[layer_type] = [layer[0] for layer in layers_sorted[:num_top_layers]]
+        yaml_filename = f"unfrozen_parameters_{self.model_name.split('/')[-1]}.yaml" if self.model_name else "unfrozen_parameters.yaml"
+        with open(yaml_filename, 'w') as file:
+            file.write("unfrozen_parameters:\n")
+            for layer_type, layer_names in top_layers_by_type.items():
+                file.write(f"# {layer_type} layers\n")
+                for layer_name in layer_names:
+                    file.write(f"- {layer_name}\n")
+        print(f"Top {top_percent}% SNR layers saved to {yaml_filename}")
 
-if selected_weight_types:
-    modifier.assess_layers_snr(selected_weight_types)
-    modifier.save_snr_to_json()
-    print("Finished SNR scanning and data saved.")
+    def save_top_snr_ratios_to_json(self, json_filename, filename="top_snr_ratios.json"):
+        top_percent = self.top_percent
+        with open(json_filename, 'r') as file:
+            snr_data = json.load(file)
+        top_snr_layers = {}
+        for layer_name, info in snr_data.items():
+            layer_type = info['type']
+            if layer_type not in top_snr_layers:
+                top_snr_layers[layer_type] = []
+            top_snr_layers[layer_type].append((layer_name, info['snr']))
+        for layer_type, layers in top_snr_layers.items():
+            layers_sorted = sorted(layers, key=lambda x: x[1], reverse=True)
+            num_top_layers = int(len(layers) * top_percent / 100)
+            top_snr_layers[layer_type] = {layer[0]: layer[1] for layer in layers_sorted[:num_top_layers]}
+        with open(filename, 'w') as file:
+            json.dump(top_snr_layers, file, indent=4)
+        print(f"Top {top_percent}% SNR layers saved to {filename}")
+
+# Handle command-line arguments
+parser = argparse.ArgumentParser(description="Process SNR data for layers.")
+parser.add_argument('--json', type=str, help='Path to existing JSON file for processing')
+parser.add_argument('--top_percent', type=int, default=None, help='Top percentage of layers to select, overriding the default')
+args = parser.parse_args()
+
+if args.json:
+    modifier = ModelModifier(top_percent=args.top_percent)
+    modifier.generate_unfrozen_params_yaml(args.json, args.top_percent)
 else:
-    print("No weight types selected.")
+    model_name = "/workspace/models/qwen-110b"
+    modifier = ModelModifier(model_name=model_name)
+    selected_weight_types = modifier.interactive_select_weights()
+    if selected_weight_types:
+        modifier.assess_layers_snr(selected_weight_types)
+        modifier.save_snr_to_json()
+        print("Finished SNR scanning and data saved.")
+    else:
+        print("No weight types selected.")

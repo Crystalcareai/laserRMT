@@ -142,23 +142,25 @@ class ModelModifier:
                     file.write(f"- {layer_name}\n")
         print(f"Top {top_percent}% SNR layers saved to {yaml_filename}")
 
-    def save_top_snr_ratios_to_json(self, json_filename, filename="top_snr_ratios.json"):
-        top_percent = self.top_percent
+    def save_top_snr_ratios_to_json(self, json_filename, filename=None):
         with open(json_filename, 'r') as file:
             snr_data = json.load(file)
-        top_snr_layers = {}
+        all_snr_layers = {}
         for layer_name, info in snr_data.items():
             layer_type = info['type']
-            if layer_type not in top_snr_layers:
-                top_snr_layers[layer_type] = []
-            top_snr_layers[layer_type].append((layer_name, info['snr']))
-        for layer_type, layers in top_snr_layers.items():
+            if layer_type not in all_snr_layers:
+                all_snr_layers[layer_type] = []
+            all_snr_layers[layer_type].append((layer_name, info['snr']))
+        for layer_type, layers in all_snr_layers.items():
             layers_sorted = sorted(layers, key=lambda x: x[1], reverse=True)
-            num_top_layers = int(len(layers) * top_percent / 100)
-            top_snr_layers[layer_type] = {layer[0]: layer[1] for layer in layers_sorted[:num_top_layers]}
+            all_snr_layers[layer_type] = {layer[0]: layer[1] for layer in layers_sorted}
+
+        json_file_base = os.path.splitext(os.path.basename(json_filename))[0]
+        filename = f"{json_file_base}_sorted.json" if filename is None else filename
+
         with open(filename, 'w') as file:
-            json.dump(top_snr_layers, file, indent=4)
-        print(f"Top {top_percent}% SNR layers saved to {filename}")
+            json.dump(all_snr_layers, file, indent=4)
+        print(f"All SNR layers sorted and saved to {filename}")
 
 # Handle command-line arguments
 parser = argparse.ArgumentParser(description="Process SNR data for layers.")

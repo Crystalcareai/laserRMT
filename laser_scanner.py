@@ -5,6 +5,7 @@ import json
 from prompt_toolkit.shortcuts import checkboxlist_dialog
 import argparse
 from tqdm import tqdm
+import os
 
 class ModelModifier:
     def __init__(self, model_name=None, top_percent=50):
@@ -12,7 +13,7 @@ class ModelModifier:
         self.top_percent = top_percent
 
         if model_name:
-            self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, trust_remote_code=True, device_map="auto")
+            self.model = AutoModelForCausalLM.from_pretrained(model_name, torch_dtype=torch.float32, low_cpu_mem_usage=True, trust_remote_code=True, device_map="auto")
             self.optimizer = torch.optim.Adam(self.model.parameters())
             self.tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, use_fast=True, add_prefix_space=True)
         else:
@@ -130,7 +131,9 @@ class ModelModifier:
             layers_sorted = sorted(layers, key=lambda x: x[1], reverse=True)
             num_top_layers = int(len(layers) * top_percent / 100)
             top_layers_by_type[layer_type] = [layer[0] for layer in layers_sorted[:num_top_layers]]
-        yaml_filename = f"unfrozen_parameters_{self.model_name.split('/')[-1]}.yaml" if self.model_name else "unfrozen_parameters.yaml"
+        # Modify the yaml_filename to include the input json name and top_percent
+        json_file_base = os.path.splitext(os.path.basename(json_filename))[0]
+        yaml_filename = f"{json_file_base}_unfrozenparameters_{top_percent}percent.yaml"
         with open(yaml_filename, 'w') as file:
             file.write("unfrozen_parameters:\n")
             for layer_type, layer_names in top_layers_by_type.items():
@@ -167,7 +170,7 @@ if args.json:
     modifier = ModelModifier(top_percent=args.top_percent)
     modifier.generate_unfrozen_params_yaml(args.json, args.top_percent)
 else:
-    model_name = "/workspace/models/qwen-110b"
+    model_name = "Qwen/Qwen1.5-1.8B"
     modifier = ModelModifier(model_name=model_name)
     selected_weight_types = modifier.interactive_select_weights()
     if selected_weight_types:
